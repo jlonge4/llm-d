@@ -1,0 +1,47 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# The Neuron vLLM DLC plus what NIXL's LIBFABRIC backend loads at startup for
+# P/D over EFA: a libcuda.so.1 stub and the EFA userspace (libfabric). Built
+# from docker/Dockerfile.neuron.
+#
+# No llm-d workflow publishes this image. Build and push it yourself, then
+# replace REPLACE_WITH_YOUR_REGISTRY below with your registry, e.g.:
+#   docker build -f docker/Dockerfile.neuron -t <registry>/llm-d-neuron:0.24.0.1.1.0-efa .
+images:
+  - name: REPLACE_MODEL_SERVER_IMAGE
+    newName: REPLACE_WITH_YOUR_REGISTRY/llm-d-neuron
+    newTag: 0.24.0.1.1.0-efa
+
+# Workaround for https://github.com/vllm-project/vllm/issues/44548, required with vLLM v0.20.0+ due to torch 2.11-2.13
+# This image pins vLLM 0.24.0 on torch 2.11.0, so it is in range.
+patches:
+  - target:
+      kind: Deployment
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: USER
+          value: llm-d
+  - target:
+      kind: LeaderWorkerSet
+    patch: |-
+      - op: add
+        path: /spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/-
+        value:
+          name: USER
+          value: llm-d
+  - target:
+      kind: DisaggregatedSet
+    patch: |-
+      - op: add
+        path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/-
+        value:
+          name: USER
+          value: llm-d
+      - op: add
+        path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/-
+        value:
+          name: USER
+          value: llm-d

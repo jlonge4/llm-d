@@ -43,6 +43,10 @@ This directory contains Kustomize Components that define the **default container
 │   └── release
 ├── mthreads-vllm
 │   └── release
+├── neuron-vllm
+│   ├── aws-efa
+│   │   └── release
+│   └── release
 ├── npu-vllm
 │   └── release
 ├── routing-sidecar

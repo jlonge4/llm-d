@@ -1,0 +1,87 @@
+# AWS Neuron (Trainium) vLLM image for llm-d P/D disaggregation over EFA.
+#
+# Starts from the public AWS Neuron vLLM Inference DLC and adds the two shared
+# libraries that NIXL's LIBFABRIC backend (libplugin_LIBFABRIC.so) dlopens at
+# startup, following the vllm-neuron setup guide ("Install dependencies for
+# disaggregated inference"):
+#
+#   * libcuda.so.1   - the plugin links it for an optional GPUDirect path that
+#                      never runs on Neuron, so the CUDA driver stub is enough.
+#   * libfabric.so.1 - the EFA userspace that carries the RDMA transfer. Only the
+#                      userspace is installed; the node supplies the kernel driver.
+#
+# Without both, every worker exits at startup with
+#   createBackend: unsupported backend 'LIBFABRIC'
+#
+# Aggregated serving (optimized-baseline, precise-prefix-cache-routing) does not
+# need this image; it runs on the DLC directly (images/neuron-vllm/release).
+#
+# Build:
+#   docker build -f docker/Dockerfile.neuron -t <registry>/llm-d-neuron:0.24.0.1.1.0-efa .
+ARG BASE_IMAGE=public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.24.0.1.1.0-neuronx-py313-sdk2.32.0-ubuntu24.04
+FROM ${BASE_IMAGE}
+
+# Invalidate subsequent layers to make sure builds are fresh
+ARG CACHE_BUSTER
+RUN if [ -n "${CACHE_BUSTER}" ]; then \
+        echo "$CACHE_BUSTER" > /tmp/builder-buster; \
+    fi;
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# The DLC runs as root; package installs below need it.
+USER root
+
+# 1. libcuda.so.1 stub, installed only when the base image does not already
+#    provide one. cuda-cudart-dev ships the driver stub without the toolkit.
+#    CUDA_REPO must match the base image's Ubuntu release. The paths are
+#    x86_64 only, which covers every Trainium instance type.
+ARG CUDA_REPO=ubuntu2404
+ARG CUDA_KEYRING=cuda-keyring_1.1-1_all.deb
+ARG CUDA_STUB_PACKAGE=cuda-cudart-dev-12-6
+ARG CUDA_STUB_DIR=/usr/local/cuda-12.6/targets/x86_64-linux/lib/stubs
+RUN if ldconfig -p | grep -q 'libcuda\.so\.1'; then \
+        echo "libcuda.so.1 already present"; \
+    else \
+        apt-get update && \
+        apt-get install -y --no-install-recommends wget ca-certificates && \
+        wget -q https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_REPO}/x86_64/${CUDA_KEYRING} && \
+        dpkg -i ${CUDA_KEYRING} && rm -f ${CUDA_KEYRING} && \
+        apt-get update && \
+        apt-get install -y --no-install-recommends ${CUDA_STUB_PACKAGE} && \
+        ln -sf ${CUDA_STUB_DIR}/libcuda.so /usr/local/lib/libcuda.so.1 && \
+        ldconfig && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# 2. EFA userspace (libfabric). Pinned so rebuilds are reproducible; bump
+#    together with the base image. --skip-kmod: the node supplies the kernel
+#    driver. --no-verify: the installer's kernel-module check reports a false
+#    failure inside a container build.
+ARG EFA_INSTALLER_VERSION=1.50.0
+RUN if ldconfig -p | grep -q 'libfabric\.so\.1' || [ -e /opt/amazon/efa/lib/libfabric.so.1 ] || [ -e /opt/amazon/efa/lib64/libfabric.so.1 ]; then \
+        echo "libfabric.so.1 already present"; \
+    else \
+        apt-get update && \
+        apt-get install -y --no-install-recommends curl ca-certificates && \
+        cd /tmp && \
+        curl -fsSLO https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz && \
+        tar -xf aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz && \
+        cd aws-efa-installer && \
+        bash efa_installer.sh --yes --skip-kmod --no-verify && \
+        cd / && rm -rf /tmp/aws-efa-installer* && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Prepend rather than replace: the DLC sets its own LD_LIBRARY_PATH for the
+# Neuron runtime. (A pod-level LD_LIBRARY_PATH would replace the image's value,
+# which is why this lives in the image and not in the overlays.)
+ENV LD_LIBRARY_PATH=/opt/amazon/efa/lib64:/opt/amazon/efa/lib:${LD_LIBRARY_PATH}
+ENV PATH=/opt/amazon/efa/bin:${PATH}
+
+# Fail the build if the LIBFABRIC plugin still cannot resolve either library.
+# libcudart.so.* is only used by the GPUDirect path and may stay unresolved.
+RUN plugin="$(python3 -c 'import nixl, pathlib; print(next(pathlib.Path(nixl.__file__).resolve().parents[1].rglob("libplugin_LIBFABRIC.so")))')" && \
+    echo "LIBFABRIC plugin: ${plugin}" && \
+    missing="$(ldd "${plugin}" | grep 'not found' | grep -v 'libcudart' || true)" && \
+    if [ -n "${missing}" ]; then echo "unresolved libraries:"; echo "${missing}"; exit 1; fi
