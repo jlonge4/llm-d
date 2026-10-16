@@ -1,0 +1,41 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../../../../recipes/modelserver/base/single-host/pd-disaggregatedset/vllm
+
+nameSuffix: -neuron
+
+components:
+  # The DLC as published. NIXL's LIBFABRIC backend also needs libcuda.so.1 (a
+  # stub) and libfabric.so.1; if the DLC lacks either, workers exit at startup
+  # with "unsupported backend 'LIBFABRIC'". Swap in the image built from
+  # docker/Dockerfile.neuron by replacing the line below with
+  #   ../../../../../recipes/modelserver/components/images/neuron-vllm/aws-efa/release
+  - ../../../../../recipes/modelserver/components/images/neuron-vllm/release
+  - ../../../../../recipes/modelserver/components/images/routing-sidecar/release
+  - ../../../../../recipes/modelserver/components/graceful-shutdown
+  - ../../../../../recipes/modelserver/components/disaggregatedset-schema
+
+labels:
+  - pairs:
+      llm-d.ai/model: Llama-3.1-8B-Instruct
+      llm-d.ai/guide: pd-disaggregation
+      llm-d.ai/accelerator-variant: neuron
+      llm-d.ai/accelerator-vendor: aws
+      llm-d.ai/engine-type: vllm
+    fields:
+      - path: spec/roles/spec/leaderWorkerTemplate/workerTemplate/metadata/labels
+        kind: DisaggregatedSet
+        create: true
+  - pairs:
+      llm-d.ai/guide: pd-disaggregation
+      llm-d.ai/accelerator-variant: neuron
+      llm-d.ai/accelerator-vendor: aws
+    fields:
+      - path: metadata/labels
+        kind: DisaggregatedSet
+        create: true
+
+patches:
+  - path: patch-prefill.yaml
+  - path: patch-decode.yaml

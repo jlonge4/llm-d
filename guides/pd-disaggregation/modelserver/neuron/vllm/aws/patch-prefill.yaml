@@ -1,0 +1,147 @@
+apiVersion: disaggregatedset.x-k8s.io/v1
+kind: DisaggregatedSet
+metadata:
+  name: pd-disagg
+spec:
+  roles:
+    - name: prefill
+      spec:
+        leaderWorkerTemplate:
+          workerTemplate:
+            spec:
+              nodeSelector:
+                node.kubernetes.io/instance-type: trn2.48xlarge
+              tolerations:
+                # EKS Neuron node groups are commonly tainted so only Neuron
+                # workloads land on them. Harmless where the taint is absent.
+                - key: aws.amazon.com/neuron
+                  operator: Exists
+                  effect: NoSchedule
+              # Prefer separate nodes. Requesting every EFA device on the node
+              # (below) makes that a hard requirement in practice; lower the EFA
+              # count to co-locate both roles on one trn2.48xlarge.
+              affinity:
+                podAntiAffinity:
+                  preferredDuringSchedulingIgnoredDuringExecution:
+                    - weight: 100
+                      podAffinityTerm:
+                        topologyKey: kubernetes.io/hostname
+                        labelSelector:
+                          matchLabels:
+                            llm-d.ai/guide: pd-disaggregation
+              containers:
+                - name: modelserver
+                  # The Neuron device plugin passes the allocated cores in
+                  # NEURON_RT_VISIBLE_CORES, which vllm-neuron rejects when TP>1 runs
+                  # worker processes. It reads the same core list from
+                  # NEURON_VISIBLE_DEVICES, so move it there. The args below become "$@".
+                  command:
+                    - /bin/bash
+                    - -c
+                    - |
+                      if [ -n "${NEURON_RT_VISIBLE_CORES:-}" ]; then
+                        export NEURON_VISIBLE_DEVICES="${NEURON_RT_VISIBLE_CORES}"
+                        unset NEURON_RT_VISIBLE_CORES
+                      fi
+                      exec vllm serve "$@"
+                    - vllm-serve
+                  args:
+                    - "meta-llama/Llama-3.1-8B-Instruct"
+                    - "--disable-access-log-for-endpoints=/health,/metrics,/v1/models"
+                    - "--tensor-parallel-size=8"
+                    - "--max-model-len=8192"
+                    - "--max-num-batched-tokens=8192"
+                    - "--max-num-seqs=8"
+                    # Prefill and decode must agree on the block size: NIXL moves whole blocks.
+                    - "--block-size=128"
+                    - "--num-gpu-blocks-override=1024"
+                    - "--additional-config"
+                    - '{"neuron_config": {"kv_segment_size_buckets": [8192], "num_batched_tokens_buckets": [8192], "num_seqs_buckets": [8]}}'
+                    # vllm-neuron's NIXL connector: same pull-based wire format as
+                    # upstream NixlConnector (so the routing sidecar's nixlv2 mode
+                    # applies), HBM-to-HBM over EFA through NIXL's LIBFABRIC
+                    # backend. "cuda" is vLLM's spelling of "the device buffer";
+                    # Neuron transfers device to device, with no host staging.
+                    - "--kv-transfer-config"
+                    - '{"kv_connector":"NeuronNixlConnector","kv_connector_module_path":"vllm_neuron.vllm.kv_connector.neuron_nixl_connector","kv_role":"kv_producer","kv_buffer_device":"cuda","kv_connector_extra_config":{"backends":["LIBFABRIC"]}}'
+                    - "--shutdown-timeout=45"
+                  env:
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: llm-d-hf-token
+                          key: HF_TOKEN
+                    - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+                      value: "5600"
+                    # Required whenever prefill and decode can share a node: without
+                    # it libfabric may pick its shared-memory transport for the
+                    # on-device KV transfer, and both servers start but return
+                    # inaccurate output. Set unconditionally because the
+                    # anti-affinity above is only a preference.
+                    - name: FI_EFA_ENABLE_SHM_TRANSFER
+                      value: "0"
+                    # Default vLLM keep-alive (5s) is shorter than llm-d-routing-sidecar's default idle
+                    # conn timeout (90s, from Go http.Transport), causing TCP RSTs on reuse.
+                    # Server keep-alive must be >= sidecar idle timeout; configured to 120s.
+                    - name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE
+                      value: "120"
+                    # Neuron compile cache (NEFFs).
+                    - name: VLLM_CACHE_ROOT
+                      value: /var/cache/vllm
+                    - name: VLLM_ENGINE_READY_TIMEOUT_S
+                      value: "7200"
+                    - name: VLLM_NEURON_COMPILATION_TIMEOUT
+                      value: "2400"
+                  # EFA registers (pins) the KV cache memory for RDMA.
+                  securityContext:
+                    capabilities:
+                      add:
+                        - IPC_LOCK
+                  resources:
+                    # aws.amazon.com/neuroncore: one logical NeuronCore per TP rank
+                    # (64 per trn2.48xlarge at the default LNC=2); keep equal to
+                    # --tensor-parallel-size. vpc.amazonaws.com/efa: all 16 EFA
+                    # devices of a trn2.48xlarge, from the EFA device plugin.
+                    limits:
+                      cpu: "16"
+                      memory: 128Gi
+                      aws.amazon.com/neuroncore: "8"
+                      vpc.amazonaws.com/efa: "16"
+                    requests:
+                      cpu: "16"
+                      memory: 128Gi
+                      aws.amazon.com/neuroncore: "8"
+                      vpc.amazonaws.com/efa: "16"
+                  volumeMounts:
+                    - mountPath: /dev/shm
+                      name: shm
+                    - mountPath: /var/cache/vllm
+                      name: neuron-compile-cache
+                  # 15 + 30x240 = 7215s: room for a cold Neuron compile plus the
+                  # weight download.
+                  startupProbe:
+                    initialDelaySeconds: 15
+                    periodSeconds: 30
+                    timeoutSeconds: 5
+                    failureThreshold: 240
+                  livenessProbe:
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+                  readinessProbe:
+                    periodSeconds: 5
+                    timeoutSeconds: 2
+                    failureThreshold: 3
+              volumes:
+                - name: shm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 20Gi
+                # Swap for a hostPath on the instance-store NVMe (or a shared
+                # PVC) to keep compiled NEFFs across pod restarts.
+                - name: neuron-compile-cache
+                  emptyDir: {}

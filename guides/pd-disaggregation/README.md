@@ -43,6 +43,7 @@ This guide includes configurations for the following accelerator and model serve
 | Biren GPU | `biren` | `Qwen/Qwen2.5-72B-Instruct-GPTQ-Int8` | 🟡 community | — | 166M · 1P+1D, each TP=4 · NixlConnector over RDMA (UCX_TLS=rc_v) |
 | Moore Threads GPU | `mthreads` | `Qwen/Qwen3-32B` | 🟡 community | 🟡 community | MTT S5000 · vLLM 1P TP=4 + 1D TP=4, Mooncake TCP; SGLang 1P+1D TP=8, Mooncake RDMA |
 | Rebellions NPU | `npu` | `MiniMaxAI/MiniMax-M2.7` | 🟡 community | — | 4 NPUs + 1 RoCE VF per pod via DRA · 1P (PP=4) + 1D (DP=4, EP) · RblnNixlConnector |
+| AWS Trainium (Neuron) | `neuron` | `meta-llama/Llama-3.1-8B-Instruct` | 🟡 community | — | trn2.48xlarge · 1P (TP=8) + 1D (TP=8) · NeuronNixlConnector over EFA (NIXL LIBFABRIC) |
 
 ✅ validated: covered by a nightly E2E workflow · 🟡 community: maintained by the hardware vendor or community, not covered by nightly E2E · ❌ not supported: tracked in the linked issue · — no configuration.
 <!-- guide:support end -->
@@ -62,6 +63,7 @@ P/D disaggregation requires a KV transfer connector to move KV cache blocks from
 | TPUConnector / TPUConnectorHMA | `tpu/*` | TPU ICI / DCN | From `tpu_inference`; HMA on TPU7x. |
 | IluNixlConnector | `iluvatar/vllm/base` | UCX with CUDA-aware transports | Iluvatar's fork of NixlConnector. See the [Iluvatar tab](#2-deploy-the-model-server). |
 | NixlConnector | `biren/vllm/base` | RDMA (`UCX_TLS=rc_v`) | Biren 166M, `kv_buffer_device=cpu`. See the [Biren tab](#2-deploy-the-model-server). |
+| NeuronNixlConnector | `neuron/vllm/aws` | NIXL LIBFABRIC over EFA | vllm-neuron's NixlConnector subclass, HBM to HBM. See the [AWS Trainium tab](#2-deploy-the-model-server). |
 | MooncakeConnector | `mthreads/vllm/base` | TCP via Mooncake MUSA transport | MTT S5000 compatibility path; requires the same TP on prefill and decode. See the [Moore Threads tab](#2-deploy-the-model-server). |
 | SGLang mooncake | `mthreads/sglang/base` | RDMA via Mooncake Transfer Engine | SGLang `--disaggregation-transfer-backend mooncake` (not vLLM `MooncakeConnector`). Same TP on prefill and decode. |
 
@@ -128,6 +130,7 @@ git clone https://github.com/llm-d/llm-d.git && cd llm-d && git checkout ${BRANC
 | `xpu` | `base`, `rdma` |
 | `tpu/v6`, `tpu/v7`, `tpu/v7-dynamic-slice` | `gke` |
 | `iluvatar`, `metax`, `biren`, `mthreads`, `npu` | `base` |
+| `neuron` | `aws` |
 
 - `base`: generic Kubernetes cluster.
 - `gke`: on NVIDIA GPU, GKE A3/A4 with GPU DRA and DRANet RoCE (see the platform table in [Prerequisites](#prerequisites)); `gke/a4x` and `gke/a4xmax` target GKE A4X / A4X Max (GB200 / GB300). On TPU, the GKE TPU node pools described in the model server step.
@@ -147,7 +150,7 @@ export NAMESPACE=llm-d-pd-disaggregation
 export MONITORING=false # options: false, true
 export MONITORING_VALUES=
 export ACCELERATOR_VALUES=
-export ACCELERATOR_TYPE=gpu # options: gpu, amd, xpu, tpu/v6, tpu/v7, tpu/v7-dynamic-slice, iluvatar, metax, biren, mthreads, npu
+export ACCELERATOR_TYPE=gpu # options: gpu, amd, xpu, tpu/v6, tpu/v7, tpu/v7-dynamic-slice, iluvatar, metax, biren, mthreads, npu, neuron
 export MODEL_SERVER=vllm # options: vllm, sglang
 export INFRA_PROVIDER=base # options: base, gke, gke/a4x, gke/a4xmax, coreweave, aws, cks-mooncake, nixl/base, nixl/amd-ci, nixl/oci, nixl/tensorwave, moriio/base, moriio/amd-ci, moriio/amd-ci-1p1d-tp8, rdma; valid values per accelerator: table above
 export MODEL=openai/gpt-oss-120b # set to the model your accelerator serves (Supported Accelerators and Model Servers table); the AMD MoRIIO overlays (INFRA_PROVIDER=moriio/*) serve Qwen/Qwen3-32B
@@ -496,6 +499,48 @@ The Rebellions configuration serves [MiniMax-M2.7](https://huggingface.co/MiniMa
 **Known issues:**
 
 - Neither the DRA allocation nor the NIXL transfer can be checked by a server dry-run against a cluster without these DeviceClasses. Both need a run on the real hardware.
+
+</details>
+<details data-when="ACCELERATOR_TYPE=neuron">
+<summary><b>AWS Trainium (Neuron)</b></summary>
+
+<!-- guide:deploy.modelserver.neuron[0] start -->
+<!-- llm-d-cicd:skip start -->
+```bash
+kubectl apply -n ${NAMESPACE} \
+  -k ${REPO_ROOT}/guides/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}/${INFRA_PROVIDER}/
+```
+<!-- llm-d-cicd:skip end -->
+<!-- guide:deploy.modelserver.neuron[0] end -->
+
+The AWS Trainium configuration serves [Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) with [vllm-neuron](https://github.com/vllm-project/vllm-neuron) from the public Neuron vLLM DLC. Set `INFRA_PROVIDER=aws` and `MODEL=meta-llama/Llama-3.1-8B-Instruct`.
+
+**Requirements:**
+
+- `trn2.48xlarge` nodes with the [Neuron device plugin](https://docs.aws.amazon.com/eks/latest/userguide/device-management-neuron.html) (advertising `aws.amazon.com/neuroncore`) and the Neuron scheduler extension that page links, which keeps each pod's cores contiguous.
+- The EFA device plugin advertising `vpc.amazonaws.com/efa`, nodes in one subnet and placement group, and a security group that allows all traffic between its own members, as in the [AWS EFA notes](../../docs/infrastructure/rdma/README.md).
+- An image that NIXL's LIBFABRIC backend can load: it needs `libcuda.so.1` (a stub is enough) and `libfabric.so.1`. Check the DLC before deploying:
+
+  ```bash
+  docker run --rm public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.24.0.1.1.0-neuronx-py313-sdk2.32.0-ubuntu24.04 bash -c \
+    "python3 -c \"from nixl._api import nixl_agent, nixl_agent_config; nixl_agent('probe', nixl_agent_config(backends=['LIBFABRIC'])); print('LIBFABRIC OK')\""
+  ```
+
+  If it reports `unsupported backend 'LIBFABRIC'`, build [`docker/Dockerfile.neuron`](../../docker/Dockerfile.neuron), push it, and switch the overlay to the `neuron-vllm/aws-efa` image component as its `kustomization.yaml` describes.
+
+**Configuration notes:**
+
+| Parameter | Prefill | Decode |
+| --- | --- | --- |
+| Parallelism | TP=8 | TP=8 |
+| NeuronCores | 8 | 8 |
+| EFA devices | 16 | 16 |
+| `--kv-transfer-config` role | `kv_producer` | `kv_consumer` |
+| `--block-size` / `--num-gpu-blocks-override` | 128 / 1024 | 128 / 1024 |
+
+- KV moves device to device over EFA through `NeuronNixlConnector` with `kv_buffer_device=cuda`, which vLLM uses to mean the device buffer. It keeps upstream `NixlConnector`'s wire format, so the routing sidecar runs in its `nixlv2` mode unchanged.
+- Each role requests all 16 EFA devices of a `trn2.48xlarge`, so prefill and decode land on separate nodes. To fit both on one node, lower the count. `FI_EFA_ENABLE_SHM_TRANSFER=0` is set either way: without it, co-located roles can start cleanly and still return inaccurate output.
+- The first start compiles the model graphs. The compile cache is an `emptyDir`, so a restarted pod compiles again; mount the instance-store NVMe instead to keep it.
 
 </details>
 <details data-when="ACCELERATOR_TYPE=mthreads">
