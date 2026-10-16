@@ -31,6 +31,7 @@ This guide includes configurations for the following accelerator and model serve
 | Intel XPU | `xpu` | `Qwen/Qwen3-0.6B` | ✅ validated | 🟡 community | vLLM: Data Center GPU Max 1550+ · SGLang: Arc Pro B60 · 2 replicas × 1 XPU via DRA · fp16 (SGLang uses the dedicated render pool) |
 | Google TPU v6e | `tpu/v6` | `Qwen/Qwen3-32B` | ✅ validated | — | GKE only · 2 replicas × 8 chips (`2x4`, TP=8) · vLLM 0.29 |
 | Google TPU v7 | `tpu/v7` | `Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8` | 🟡 community | — | GKE only · 2 replicas × 4 chips (`2x2x1`, TP=8) · vLLM 0.29 |
+| AWS Trainium (Neuron) | `neuron` | `meta-llama/Llama-3.1-8B-Instruct` | 🟡 community | — | trn2.48xlarge · 2 replicas × TP=8 (8 NeuronCores each) · vllm-neuron 0.24 DLC (render routes on by default, no `--enable-scale-out`) |
 | CPU | `cpu` | `meta-llama/Llama-3.2-3B-Instruct` | 🟡 community | — | 2 replicas |
 
 ✅ validated: covered by a nightly E2E workflow · 🟡 community: maintained by the hardware vendor or community, not covered by nightly E2E · ❌ not supported: tracked in the linked issue · — no configuration.
@@ -74,6 +75,10 @@ Responses support is a preview: vLLM renders it natively, but the router's token
 
 - For the Intel XPU overlay, install the accelerator's resource driver and verify its DeviceClass before deployment. These manifests use the `resource.k8s.io/v1` DRA APIs, which require **Kubernetes 1.34+**; on 1.32/1.33 the driver may install but the overlay will still fail to apply.
 
+- For the AWS Trainium overlay (`ACCELERATOR_TYPE=neuron`), run `trn2.48xlarge` nodes with the [Neuron device plugin](https://docs.aws.amazon.com/eks/latest/userguide/device-management-neuron.html) (advertising `aws.amazon.com/neuroncore`) and the Neuron scheduler extension that page links.
+  The overlay serves `meta-llama/Llama-3.1-8B-Instruct` with `--block-size=128`; the router step layers [`router/precise-prefix-cache-routing.neuron.values.yaml`](./router/precise-prefix-cache-routing.neuron.values.yaml) so the token producer's model and block size match.
+  vLLM 0.24 in the Neuron image serves the `/v1/*/render` routes without `--enable-scale-out`, a flag it does not have.
+
 - Create a [HuggingFace token](../../helpers/hf-token.md) and export it as `HF_TOKEN` in your shell. The router also reads it to reach gated tokenizers.
 
 - (Optional) Set up the [monitoring stack](../../docs/operations/observability/setup.md) if you plan to enable Prometheus monitoring.
@@ -103,7 +108,8 @@ export NAMESPACE=llm-d-precise-prefix-cache-routing
 export MONITORING=false # options: false, true
 export MONITORING_VALUES=
 export ENGINE_VALUES=
-export ACCELERATOR_TYPE=gpu # options: gpu, amd, xpu, tpu/v6, tpu/v7, cpu
+export ACCELERATOR_VALUES=
+export ACCELERATOR_TYPE=gpu # options: gpu, amd, xpu, tpu/v6, tpu/v7, neuron, cpu
 export MODEL_SERVER=vllm # options: vllm, sglang
 export INFRA_PROVIDER=base # options: base, gke
 export MODEL=Qwen/Qwen3-32B # set to the model your accelerator serves (table above)
@@ -207,6 +213,16 @@ export MONITORING_VALUES="-f ${REPO_ROOT}/guides/recipes/router/features/monitor
 </details>
 <!-- tabs:end -->
 
+**(AWS Trainium only) Layer the Neuron router values**, which point the token producer at the Neuron overlay's model (`meta-llama/Llama-3.1-8B-Instruct`) and block size (128):
+
+<!-- guide:deploy.accelerator_values[0] start -->
+<!-- llm-d-cicd:skip start -->
+```bash
+export ACCELERATOR_VALUES="-f ${REPO_ROOT}/guides/${GUIDE_NAME}/router/${GUIDE_NAME}.neuron.values.yaml"
+```
+<!-- llm-d-cicd:skip end -->
+<!-- guide:deploy.accelerator_values[0] end -->
+
 **Deploy the router** in [Standalone Mode](../../docs/architecture/router/proxy.md), with an Envoy sidecar in front of the router. The release name `${GUIDE_NAME}` is mandatory: the `InferencePool` selector matches a guide label that pairs with this release. To front the router with a Kubernetes Gateway instead, see Gateway Mode in the [Optimized Baseline](../optimized-baseline/README.md#1-deploy-the-llm-d-router).
 
 <!-- guide:deploy.standalone start -->
@@ -217,6 +233,7 @@ helm install ${GUIDE_NAME} \
   ${MONITORING_VALUES} \
   -f ${ROUTER_VALUES} \
   ${ENGINE_VALUES} \
+  ${ACCELERATOR_VALUES} \
   -n ${NAMESPACE} --version ${ROUTER_CHART_VERSION}
 ```
 <!-- guide:deploy.standalone end -->

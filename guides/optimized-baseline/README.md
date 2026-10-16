@@ -45,6 +45,7 @@ This guide includes configurations for the following accelerator and model serve
 | Google TPU v7 | `tpu/v7` | `Qwen/Qwen3-32B` | 🟡 community | — | — | — | GKE only · 2 replicas × 4 chips (`2x2x1`, TP=8) |
 | Google TPU v7 (dynamic slicing) | `tpu/v7-dynamic-slice` | `Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8` | 🟡 community | — | — | — | GKE dynamic slicing + Kueue · one sub-slice per replica (`TPU_SLICE_TOPOLOGY`: `2x2x1`, `2x2x2`); see [below](#2-deploy-the-model-server) |
 | Rebellions NPU | `npu` | `openai/gpt-oss-120b` | 🟡 community | — | — | — | RBLN-CR series · 2 replicas × 1 NPU via DRA |
+| AWS Trainium (Neuron) | `neuron` | `meta-llama/Llama-3.1-8B-Instruct` | 🟡 community | — | — | — | trn2.48xlarge · 2 replicas × TP=8 (8 NeuronCores each) · vllm-neuron 0.24 DLC |
 | CPU | `cpu` | `meta-llama/Llama-3.2-3B-Instruct` | 🟡 community | — | — | — | x86 with AMX or AVX512-BF16 (Sapphire Rapids+, GCP C3, AMD Zen 4+) · 2 replicas × 64 cores / 64 GiB (CPUs without AMX/AVX512-BF16, e.g. Cascade/Ice Lake, need `--dtype=float32` for the bf16 model) |
 | Iluvatar GPU | `iluvatar` | `deepseek-ai/DeepSeek-V4-Flash` | 🟡 community | — | — | — | BI-V150 (dual-die) · 1 replica × 4 GPUs |
 | MetaX GPU | `metax` | `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` | 🟡 community | — | — | — | 2 replicas × TP=8 (16 GPUs) |
@@ -75,6 +76,10 @@ The MThreads **SGLang** overlay colocates prefill and decode for
 
 - For DRA-based overlays (Intel XPU, Rebellions NPU), install the accelerator's resource driver and verify its DeviceClass before deployment. These manifests use the `resource.k8s.io/v1` DRA APIs, which require **Kubernetes 1.34+**; on 1.32/1.33 the driver may install but these overlays will still fail to apply.
 
+- For the AWS Trainium overlay (`ACCELERATOR_TYPE=neuron`), run `trn2.48xlarge` nodes with the [Neuron device plugin](https://docs.aws.amazon.com/eks/latest/userguide/device-management-neuron.html) installed, so that nodes advertise `aws.amazon.com/neuroncore`, plus the Neuron scheduler extension that page links, which keeps each pod's cores contiguous.
+  Each replica requests 8 NeuronCores for `--tensor-parallel-size=8`; keep the two equal if you change either. The first start compiles the model graphs, which can take several minutes, and the compile cache is an `emptyDir`, so a restarted pod compiles again.
+  Prefix caching stays on (the vllm-neuron default), sized with an explicit `--num-gpu-blocks-override`, so the default router values apply unchanged.
+
 - Create a [HuggingFace token](../../helpers/hf-token.md) and export it as `HF_TOKEN` in your shell.
 
 - (Optional) Set up the [monitoring stack](../../docs/operations/observability/setup.md) if you plan to enable Prometheus monitoring.
@@ -103,7 +108,7 @@ export GUIDE_NAME=optimized-baseline
 export NAMESPACE=llm-d-optimized-baseline
 export MONITORING=false # options: false, true
 export MONITORING_VALUES=
-export ACCELERATOR_TYPE=gpu # options: gpu, amd, xpu, tpu/v6, tpu/v7, tpu/v7-dynamic-slice, npu, cpu, iluvatar, metax, biren, mthreads
+export ACCELERATOR_TYPE=gpu # options: gpu, amd, xpu, tpu/v6, tpu/v7, tpu/v7-dynamic-slice, npu, neuron, cpu, iluvatar, metax, biren, mthreads
 export MODEL_SERVER=vllm # options: vllm, sglang, trtllm, atom
 export INFRA_PROVIDER=base # options: base, gke, amd-ci
 export TPU_SLICE_TOPOLOGY=2x2x1 # options: 2x2x1, 2x2x2

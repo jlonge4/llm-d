@@ -48,6 +48,13 @@ support:
       providers:
         - {name: gke, label: "GKE"}
       engines: {vllm: community}
+    neuron:
+      label: AWS Trainium (Neuron)
+      notes: "trn2.48xlarge · 2 replicas × TP=8 (8 NeuronCores each) · vllm-neuron 0.24 DLC (render routes on by default, no `--enable-scale-out`)"
+      model: meta-llama/Llama-3.1-8B-Instruct
+      providers:
+        - {name: base, label: "Kubernetes (base)"}
+      engines: {vllm: community}
     cpu:
       label: CPU
       notes: "2 replicas"
@@ -69,8 +76,10 @@ env:
     MONITORING: {default: "false", values: ["false", "true"]}
     MONITORING_VALUES: {default: ""}
     ENGINE_VALUES: {default: ""}
+    # Extra router values for accelerators that need them (set by deploy.accelerator_values).
+    ACCELERATOR_VALUES: {default: ""}
 
-    ACCELERATOR_TYPE: {default: gpu, values: [gpu, amd, xpu, "tpu/v6", "tpu/v7", cpu]}
+    ACCELERATOR_TYPE: {default: gpu, values: [gpu, amd, xpu, "tpu/v6", "tpu/v7", neuron, cpu]}
     MODEL_SERVER: {default: vllm, values: [vllm, sglang]}
     # gke: GKE overlays (ACCELERATOR_TYPE=gpu, tpu/*, cpu)
     INFRA_PROVIDER: {default: base, values: [base, gke]}
@@ -123,6 +132,16 @@ deploy:
         skip_in: [ci]
         run: export MONITORING_VALUES="-f ${REPO_ROOT}/guides/recipes/router/features/monitoring-gke.values.yaml"
 
+  # The AWS Trainium overlay serves Llama-3.1-8B-Instruct with --block-size=128,
+  # so the router's token-producer modelName and blockSizeTokens must follow it
+  # (router/precise-prefix-cache-routing.neuron.values.yaml). No nightly covers
+  # this accelerator; skip_in: [ci] keeps the README-parsing nightlies from
+  # harvesting the export.
+  accelerator_values:
+    - when: {ACCELERATOR_TYPE: [neuron]}
+      skip_in: [ci]
+      run: export ACCELERATOR_VALUES="-f ${REPO_ROOT}/guides/${GUIDE_NAME}/router/${GUIDE_NAME}.neuron.values.yaml"
+
   standalone:
     - run: |
         helm install ${GUIDE_NAME} \
@@ -131,6 +150,7 @@ deploy:
           ${MONITORING_VALUES} \
           -f ${ROUTER_VALUES} \
           ${ENGINE_VALUES} \
+          ${ACCELERATOR_VALUES} \
           -n ${NAMESPACE} --version ${ROUTER_CHART_VERSION}
 
   modelserver:
