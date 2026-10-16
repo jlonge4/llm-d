@@ -9,6 +9,7 @@ Maintainers for each accelerator type are listed below. See our well-lit path gu
 | Vendor | Models | Maintainers |
 | --- | --- | --- |
 | AMD | ROCm | Kenny Roche (<Kenny.Roche@amd.com>), Vincent Cave (<Vincent.Cave@amd.com>) |
+| AWS | [Trainium (Neuron)](#aws-trainium-neuron) | Josh Longenecker (@jlonge4) |
 | Biren | 166M | FengSibo (@fengsibo, <fengsiboacer@gmail.com>), Mengxuan Li (@archlitchi, <mengxuan.li@dynamia.ai>) |
 | CPU | x86_64 | Hongming Zheng (@ZhengHongming888, <hongming.zheng@intel.com>) |
 | Google | [TPU](../infrastructure/providers/gke/README.md) | Edwin Hernandez (@Edwinhr716), Cong Liu (@liu-cong, <congliu.thu@gmail.com>) |
@@ -175,3 +176,41 @@ CPU-only inference is supported for deployments without GPU accelerators. This e
 **Set `MODEL` when running the guide's steps.** The CPU overlay serves
 `meta-llama/Llama-3.2-3B-Instruct`, while the guide defaults `MODEL` to `Qwen/Qwen3-32B`. Export
 `MODEL=meta-llama/Llama-3.2-3B-Instruct` so the validation and benchmark steps address the served model.
+
+## AWS Trainium (Neuron)
+
+AWS Trainium is supported through [vllm-neuron](https://github.com/vllm-project/vllm-neuron),
+an out-of-tree vLLM platform plugin, from the public
+[Neuron vLLM Inference DLC](https://github.com/aws-neuron/deep-learning-containers#vllm-inference-neuronx)
+(`public.ecr.aws/neuron/pytorch-inference-vllm-neuronx`, vLLM 0.24, Neuron SDK 2.32). All
+overlays target `trn2.48xlarge` and serve `meta-llama/Llama-3.1-8B-Instruct` at TP=8:
+
+- [Optimized Baseline](../../guides/optimized-baseline/README.md) `modelserver/neuron/vllm/` — two replicas of 8 NeuronCores each.
+- [Precise Prefix Cache Routing](../../guides/precise-prefix-cache-routing/README.md) `modelserver/neuron/vllm/` — two replicas publishing vLLM KV events; layer `router/precise-prefix-cache-routing.neuron.values.yaml`.
+- [P/D Disaggregation](../../guides/pd-disaggregation/README.md) `modelserver/neuron/vllm/aws/` — 1P (TP=8) + 1D (TP=8), `NeuronNixlConnector` over EFA through NIXL's LIBFABRIC backend.
+
+**Cluster prerequisites:**
+
+- The [Neuron device plugin](https://docs.aws.amazon.com/eks/latest/userguide/device-management-neuron.html),
+  which advertises `aws.amazon.com/neuron` and `aws.amazon.com/neuroncore`, and the Neuron
+  scheduler extension that page links, which keeps a pod's NeuronCores contiguous. The
+  overlays request `aws.amazon.com/neuroncore` equal to `--tensor-parallel-size`. Do not run
+  the Neuron DRA driver on the same nodes.
+- For P/D: the EFA device plugin (`vpc.amazonaws.com/efa`), nodes in one subnet and placement
+  group, and a security group that allows all traffic between its members.
+
+**Images.** The aggregated overlays run the DLC as published. NIXL's LIBFABRIC backend
+also needs `libcuda.so.1` (a stub is enough; nothing on the Neuron path calls it) and
+`libfabric.so.1`. If the DLC lacks either, P/D workers exit at startup with
+`unsupported backend 'LIBFABRIC'`; [`docker/Dockerfile.neuron`](../../docker/Dockerfile.neuron)
+adds both on top of the DLC, and the `neuron-vllm/aws-efa` image component points at the result.
+
+**Compilation.** Neuron compiles the model graphs on first start, so the overlays allow
+a two-hour startup probe. The compile cache (`VLLM_CACHE_ROOT`) is an `emptyDir`; mount the
+instance-store NVMe there to keep compiled graphs across pod restarts.
+
+**Prefix caching** is on by default in vllm-neuron. Neuron sizes the KV cache from an explicit
+block count, so the overlays set `--num-gpu-blocks-override` with room to keep prefixes resident.
+
+**Set `MODEL=meta-llama/Llama-3.1-8B-Instruct`** when running the guide steps, since the guides
+default to a different model.
